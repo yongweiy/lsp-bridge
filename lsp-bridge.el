@@ -99,6 +99,7 @@
 (require 'lsp-bridge-dart)
 (require 'lsp-bridge-semantic-tokens)
 (require 'lsp-bridge-rust)
+(require 'lsp-bridge-texlab)
 (require 'lsp-bridge-breadcrumb)
 
 (defgroup lsp-bridge nil

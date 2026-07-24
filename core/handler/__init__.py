@@ -79,3 +79,5 @@ from core.handler.workspace_diagnostics import WorkspaceDiagnostics  # noqa: F40
 from core.handler.diagnostic import Diagnostic # noqa: F401
 from core.handler.breadcrumb import Breadcrumb # noqa: F401
 from core.handler.document_highlight import DocumentHighlight # noqa: F401
+from core.handler.texlab_build import TexlabBuild  # noqa: F401
+from core.handler.texlab_forward_search import TexlabForwardSearch  # noqa: F401
