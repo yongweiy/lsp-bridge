@@ -110,6 +110,11 @@ REMOTE_FILE_SYNC_CHANNEL = 9999
 REMOTE_FILE_COMMAND_CHANNEL = 9998
 REMOTE_FILE_ELISP_CHANNEL = 9997
 
+# Max seconds to wait for an auto-started remote lsp-bridge process to begin
+# accepting connections.  Its listening ports can come up slowly, and over a
+# slow ProxyCommand/WSSH tunnel a fixed delay loses the race.
+REMOTE_PROCESS_READY_TIMEOUT = 15
+
 
 class LspBridge:
     def __init__(self, args):
@@ -270,28 +275,14 @@ class LspBridge:
             server_host = self.host_ip_dict[server_host]
 
         if is_valid_ip(server_host):
-            # When the remote server sends messages back, it tags them with the
-            # SSH client's IP (from client_address).  If we used a ProxyCommand
-            # hostname (not an IP) when registering in host_names, the IP won't
-            # be found directly.  Try to reuse an existing client for the same
-            # port under a different (hostname) key, and cache the IP-to-hostname
-            # mapping for future lookups.
-            if server_host not in self.host_names:
-                # Check if we already have a connected client on this port
-                # under a different hostname key.
-                for client_key in self.client_dict:
-                    if client_key.endswith(f":{server_port}"):
-                        existing_host = client_key.rsplit(":", 1)[0]
-                        if existing_host in self.host_names:
-                            self.host_ip_dict[server_host] = existing_host
-                            server_host = existing_host
-                            break
             return self._get_remote_file_client(server_host, server_port, is_retry)
-        elif server_host in self.host_names:
-            # Non-IP hostname that was registered via sync_tramp_remote (e.g. ProxyCommand hosts)
+        elif server_host in self.host_names or "." in server_host:
+            # Non-IP hostname that was registered via sync_tramp_remote (e.g. ProxyCommand hosts).
+            # FQDNs (containing dots) are also routed here — after a restart host_names is empty
+            # but the hostname is still a valid SSH target, not a docker container.
             return self._get_remote_file_client(server_host, server_port, is_retry)
         else:
-            # server_host is the container_name
+            # server_host is the container_name (no dots, no IP)
             return self._get_docker_file_client(server_host, server_port)
 
     def _get_remote_file_client(self, server_host, server_port, is_retry):
@@ -330,11 +321,24 @@ class LspBridge:
             message_emacs(f"login {ssh_conf} failed, please check *lsp-bridge*")
             return None
 
+        def _on_client_dead(dead_client):
+            # Don't touch client_dict here — all client eviction is handled by
+            # send_message_dispatcher to avoid races between receive threads and
+            # send threads.  Ask Emacs to auto-recover: the tunnel can wedge
+            # while the local EPC stays alive, so nothing else notices, and a
+            # bare re-sync does not revive a wedged client.  The elisp side
+            # debounces + restarts the local process, which then re-syncs remote
+            # buffers and relaunches their LSP servers.
+            message_emacs(f"Remote connection to {server_host} lost, auto-recovering...")
+            eval_in_emacs('lsp-bridge--remote-tunnel-dead', server_host)
+
+        client.on_dead = _on_client_dead
+
         try:
             client.create_channel()
         except paramiko.ChannelException:
-            # Channel Exception indicates that we clould not established channel
-            # the remote process may not exist, try to start the process
+            # Channel Exception indicates that we could not establish the
+            # channel; the remote process may not exist yet.
             if is_retry:
                 return None
 
@@ -342,13 +346,28 @@ class LspBridge:
             if not remote_start_automatically:
                 message_emacs(f"please make sure `lsp_bridge.py` has start at server {server_host} (lsp-bridge-remote-start-automatically is disabled)")
                 return None
-            # try to start remote process if it does not exist
+            # Try to start the remote process, then poll until it is actually
+            # accepting connections.  The daemon's port can take a while to
+            # start listening after launch -- and over a slow ProxyCommand/WSSH
+            # tunnel a fixed delay loses the race, producing
+            # "channel open FAILED: Connection refused".  Retry the channel
+            # open (reusing the existing SSH transport) until it succeeds or we
+            # hit the timeout.
             message_emacs(f"Start lsp-bridge process on {server_host} automatically...")
             client.start_lsp_bridge_process()
-            # wait a while for the remote process to be ready
-            time.sleep(2)
-            # if client is not None, it has been started and put into client_dict
-            return self.get_socket_client(server_host, server_port, is_retry=True)
+            deadline = time.time() + REMOTE_PROCESS_READY_TIMEOUT
+            while time.time() < deadline:
+                time.sleep(0.5)
+                try:
+                    client.create_channel()
+                except paramiko.ChannelException:
+                    continue
+                else:
+                    client.start()
+                    self.client_dict[client_id] = client
+                    return client
+            message_emacs(f"lsp-bridge process on {server_host} did not become ready within {REMOTE_PROCESS_READY_TIMEOUT}s")
+            return None
         else:
             client.start()
             self.client_dict[client_id] = client
@@ -379,19 +398,40 @@ class LspBridge:
             queue.join()
 
     def send_message_dispatcher(self, queue, port):
-        try:
-            while True:
+        # `while True` must be the OUTERMOST construct: the per-message
+        # try/except lives INSIDE the loop so that no single failed message can
+        # ever terminate the sender thread.  Previously `get_socket_client`
+        # (which can raise, e.g. paramiko.AuthenticationException during a WSSH
+        # outage) sat outside the inner try; its exception escaped to an outer
+        # except that wrapped the whole loop, killing the thread permanently.
+        # After that, every queued lsp_request (find-def, hover, completion) was
+        # silently dropped into a queue with no consumer -- while pushed
+        # diagnostics kept flowing on the separate receiver thread, so the
+        # session looked healthy.
+        while True:
+            try:
                 data = queue.get(True)
+            except Exception:
+                logger.error(traceback.format_exc())
+                continue
 
+            try:
                 server_host = data["host"]
                 client = self.get_socket_client(server_host, port)
+                if client is None:
+                    # Couldn't (re)establish a client; drop this message rather
+                    # than crash on None.send_message.  A later message will
+                    # retry the connection.
+                    logger.error("No client for %s:%s, dropping message %s",
+                                 server_host, port, data["message"])
+                    continue
                 try:
                     client.send_message(data["message"])
                 except SendMessageException as e:
                     # lsp-bridge process might has been restarted, making the orignal socket no longer valid.
                     logger.exception("Connection %s is broken, message %s, error %s", f"{server_host}:{port}", data["message"], e)
                     # remove all the clients for server_host from client_dict
-                    # client will be created again when get_socket_client is called
+                    # so remote_sync sees missing clients and reconnects them
                     for client_id in [key for key in self.client_dict.keys() if key.startswith(server_host + ":")]:
                         self.client_dict.pop(client_id, None)
 
@@ -399,18 +439,17 @@ class LspBridge:
                     try:
                         client = self.get_socket_client(server_host, port)
                     except Exception as e:
-                        # FATAL: unable to restore
+                        # unable to restore; a later message will retry
                         logger.exception(e)
                     else:
                         # connection restored, try to send out the message
-                        client.send_message(data["message"])
-                        eval_in_emacs('lsp-bridge-remote-reconnect', server_host, True)
-                except Exception as e:
-                    logger.exception(e)
-                finally:
-                    queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
+                        if client is not None:
+                            client.send_message(data["message"])
+                            eval_in_emacs('lsp-bridge-remote-reconnect', server_host, True)
+            except Exception:
+                logger.error(traceback.format_exc())
+            finally:
+                queue.task_done()
 
     def receive_remote_message(self, message, server_port):
         if server_port == REMOTE_FILE_SYNC_CHANNEL:

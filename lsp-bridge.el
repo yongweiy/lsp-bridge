@@ -1445,19 +1445,74 @@ network disconnect)."
 
 (defalias 'lsp-bridge-stop-process #'lsp-bridge-kill-process)
 
+(defvar lsp-bridge--tearing-down nil
+  "Non-nil while `lsp-bridge--kill-python-process' is intentionally tearing
+down state.  The auto-restart-on-disconnect advice consults this flag to
+distinguish user-initiated shutdown from socket death.")
+
 (defun lsp-bridge--kill-python-process ()
-  "Kill LSP-Bridge background python process."
+  "Kill LSP-Bridge background python process.
+Always tears down the OS process, EPC server, and connection buffers so that
+`lsp-bridge-restart-process' can recover from a dead-EPC state (e.g. after a
+network interruption) where the Python process is still running but the EPC
+handshake never completed."
+  (let ((lsp-bridge--tearing-down t))
   (when (lsp-bridge-process-live-p)
-    ;; Cleanup before exit LSP-Bridge server process.
     (lsp-bridge-call-async "cleanup")
-    ;; Delete LSP-Bridge server process.
-    (lsp-bridge-epc-stop-epc lsp-bridge-epc-process)
-    ;; Kill *lsp-bridge* buffer.
-    (when (get-buffer lsp-bridge-name)
-      (kill-buffer lsp-bridge-name))
-    (setq lsp-bridge-epc-process nil)
-    (setq lsp-bridge-internal-process nil)
-    (message "[LSP-Bridge] Process terminated.")))
+    (lsp-bridge-epc-stop-epc lsp-bridge-epc-process))
+  (when (process-live-p lsp-bridge-internal-process)
+    (delete-process lsp-bridge-internal-process))
+  (when (process-live-p lsp-bridge-server)
+    (delete-process lsp-bridge-server))
+  (dolist (entry lsp-bridge-epc-server-client-processes)
+    (when (process-live-p (car entry))
+      (delete-process (car entry))))
+  (setq lsp-bridge-epc-server-client-processes nil)
+  (setq lsp-bridge-epc-server-processes
+        (cl-remove-if-not (lambda (e) (process-live-p (car e)))
+                          lsp-bridge-epc-server-processes))
+  (when (get-buffer lsp-bridge-name)
+    (kill-buffer lsp-bridge-name))
+  ;; Drain stale deferred work and the live-connections registry so a fresh
+  ;; connection's dispatch isn't shadowed by a queued task whose callback was
+  ;; baked with a now-defunct manager.
+  (setq lsp-bridge-deferred-queue nil)
+  (when (boundp 'lsp-bridge-epc-live-connections)
+    (setq lsp-bridge-epc-live-connections nil))
+  (setq lsp-bridge-epc-process nil)
+  (setq lsp-bridge-internal-process nil)
+  (setq lsp-bridge-server nil)
+  (setq lsp-bridge-server-port nil)
+  (message "[LSP-Bridge] Process terminated.")))
+
+(defcustom lsp-bridge-auto-restart-on-disconnect t
+  "When non-nil, automatically restart lsp-bridge if the Python EPC connection
+dies unexpectedly (e.g. after laptop sleep).  The Python side does not
+auto-reconnect, so respawning is the only recovery path."
+  :type 'boolean
+  :group 'lsp-bridge)
+
+(defvar lsp-bridge--auto-restart-timer nil)
+
+(defun lsp-bridge--maybe-auto-restart (connection)
+  "If a CONNECTION belonging to lsp-bridge dies and we weren't tearing down,
+schedule a deferred restart."
+  (when (and lsp-bridge-auto-restart-on-disconnect
+             (not lsp-bridge--tearing-down)
+             ;; Only act on the inbound connection from our own Python process.
+             (assq (lsp-bridge-epc-connection-process connection)
+                   lsp-bridge-epc-server-client-processes)
+             (not (timerp lsp-bridge--auto-restart-timer)))
+    (setq lsp-bridge--auto-restart-timer
+          (run-at-time 0.5 nil
+                       (lambda ()
+                         (setq lsp-bridge--auto-restart-timer nil)
+                         (message "[LSP-Bridge] EPC disconnected, restarting...")
+                         (lsp-bridge-restart-process))))))
+
+(advice-add 'lsp-bridge-epc-process-sentinel :after
+            (lambda (connection _process _msg)
+              (lsp-bridge--maybe-auto-restart connection)))
 
 (defun lsp-bridge--first-start (lsp-bridge-epc-port)
   "Call `lsp-bridge--open-internal' upon receiving `start_finish' signal from server."
@@ -3245,7 +3300,16 @@ then BODY is executed within that buffer."
                                                   (add-hook 'kill-buffer-hook 'lsp-bridge-remote-kill-buffer nil t)
                                                   (setq lsp-bridge-tramp-sync-var t)
                                                   (message "[LSP-Bridge] remote file %s updated info successfully."
-                                                           (buffer-file-name))))
+                                                           (buffer-file-name))
+
+                                                  ;; After a (re)connect, the remote daemon may have discarded
+                                                  ;; this file's state (e.g. its LSP servers were killed when a
+                                                  ;; disconnect outlived the grace period).  Replay an action so
+                                                  ;; the remote lazily re-opens the file and relaunches its LSP
+                                                  ;; servers -- without this, a reconnected buffer looks
+                                                  ;; connected but has no language server behind it.
+                                                  (when (and lsp-bridge-mode (lsp-bridge-has-lsp-server-p))
+                                                    (lsp-bridge-call-file-api "change_cursor" (lsp-bridge--position)))))
 
 (defun lsp-bridge-tramp-show-hostnames ()
   (interactive)
@@ -3311,6 +3375,13 @@ SSH tramp file name is like /ssh:user@host#port:path"
                                                                         lsp-bridge-remote-file-port
                                                                         lsp-bridge-remote-file-path))))
         (lsp-bridge-sync-tramp-remote force)))))
+
+(defun lsp-bridge-remote-reconnect-manual ()
+  "Manually reconnect the remote lsp-bridge session for the current buffer."
+  (interactive)
+  (if lsp-bridge-remote-file-host
+      (lsp-bridge-remote-reconnect lsp-bridge-remote-file-host t)
+    (message "Current buffer is not a remote lsp-bridge buffer")))
 
 (defvar lsp-bridge-remote-file-window nil)
 (defun lsp-bridge-open-remote-file--response(tramp-method user host port path content position)

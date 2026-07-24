@@ -127,6 +127,9 @@ class SubprocessSSHClient:
         )
         return SubprocessSSHChannel(proc)
 
+    def close(self):
+        pass
+
 
 class RemoteFileClient(threading.Thread):
     remote_password_dict = {}
@@ -155,6 +158,35 @@ class RemoteFileClient(threading.Thread):
         # caller can use client ssh to execute command on remote server
         # ande then call create_channel() to create the channel
         self.chan = None
+
+        # Death notification: fires at most once when the connection is lost.
+        self._dead = threading.Event()
+        self.on_dead = None
+
+    def close(self):
+        """Close the SSH channel and transport, releasing file descriptors."""
+        try:
+            if self.chan is not None:
+                self.chan.close()
+        except Exception:
+            pass
+        try:
+            if self.ssh is not None:
+                self.ssh.close()
+        except Exception:
+            pass
+
+    def _notify_dead(self):
+        """Signal that this connection is dead.  Fires on_dead at most once."""
+        if self._dead.is_set():
+            return
+        self._dead.set()
+        callback = self.on_dead
+        if callback is not None:
+            try:
+                callback(self)
+            except Exception:
+                logger.error(traceback.format_exc())
 
     def ssh_private_key(self):
         """Retrieves the path to the SSH private key file.
@@ -274,8 +306,13 @@ class RemoteFileClient(threading.Thread):
 
         :raises: :class:`paramiko.ChannelException`: if server lsp-bridge process doesn't exisit
         """
+        # The destination of direct-tcpip is resolved by the *remote* sshd, not us.
+        # Using the host's FQDN here can fail if the FQDN resolves to a link-local
+        # address on the remote side (e.g. EC2 dev desktops where the FQDN
+        # resolves to fe80::...). 127.0.0.1 always works because the lsp-bridge
+        # remote process listens on 0.0.0.0.
         self.chan = self.ssh.get_transport().open_channel(
-            "direct-tcpip", (self.ssh_host, self.server_port), ("0.0.0.0", 0)
+            "direct-tcpip", ("127.0.0.1", self.server_port), ("0.0.0.0", 0)
         )
         if self.chan:
             [self.remote_heartbeat_interval] = get_emacs_vars(["lsp-bridge-remote-heartbeat-interval"])
@@ -290,6 +327,7 @@ class RemoteFileClient(threading.Thread):
                 time.sleep(self.remote_heartbeat_interval)
         except Exception as e:
             logger.exception(e)
+            self._notify_dead()
 
     def send_message(self, message):
         """Send message via the channel
@@ -299,7 +337,7 @@ class RemoteFileClient(threading.Thread):
         try:
             data = json.dumps(message)
             self.chan.sendall(f"{data}\n".encode("utf-8"))
-        except socket.error as e:
+        except Exception as e:
             raise SendMessageException() from e
         else:
             log_time_debug(f"Sended to server {self.ssh_host} port {self.server_port}: {message}")
@@ -469,28 +507,38 @@ class RemoteFileServer:
             logger.exception(e)
 
     def handle_client(self):
+        # Capture socket/address locally so cleanup doesn't affect a newer
+        # connection that may have overwritten self.client_socket.
+        sock = self.client_socket
+        addr = self.client_address
         try:
-            client_file = self.client_socket.makefile('r')
+            client_file = sock.makefile('r')
             while True:
                 data = client_file.readline().strip()
                 if not data:
                     break
                 elif data == "ping":
-                    log_time_debug(f"Server port {self.port} received ping from client {self.client_address}")
+                    log_time_debug(f"Server port {self.port} received ping from client {addr}")
                     continue
 
-                message = parse_json_content(data)
-                log_time_debug(f"Server port {self.port} received message from client {self.client_address}: {message}")
+                try:
+                    message = parse_json_content(data)
+                except Exception:
+                    logger.error(f"Server port {self.port} failed to parse from client {addr}: {data!r}")
+                    continue
+                log_time_debug(f"Server port {self.port} received message from client {addr}: {message}")
                 resp = self.handle_message(message)
                 if resp:
-                    self.client_socket.send(f"{resp}\n".encode("utf-8"))
+                    sock.send(f"{resp}\n".encode("utf-8"))
 
             client_file.close()
-            self.client_socket.shutdown(socket.SHUT_RDWR)
-            self.client_socket.close()
-            log_time(f"Server port {self.port} socket close for client {self.client_address}")
-            self.client_socket = None
-            self.client_address = None
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+            log_time(f"Server port {self.port} socket close for client {addr}")
+            # Only clear instance variables if they still point to this socket.
+            if self.client_socket is sock:
+                self.client_socket = None
+                self.client_address = None
         except Exception as e:
             logger.exception(e)
 
@@ -645,8 +693,19 @@ class FileElispServer(RemoteFileServer):
             return
         else:
             ts = message["timestamp"]
-            self.rpcs[ts]["result"] = message["result"]
-            self.rpcs[ts]["completion"].set()
+            # A response may arrive for an RPC we no longer track: on a
+            # reconnect the waiting `call_remote_rpc` is woken with a None
+            # result and deletes its entry, after which a late response from
+            # the previous connection can still land here.  Ignore it instead
+            # of raising KeyError, which would crash the receive loop and break
+            # the reconnect handshake (get-project-path / get-multi-lang-server
+            # callbacks, and thus LSP server relaunch, depend on it).
+            rpc = self.rpcs.get(ts)
+            if rpc is None:
+                log_time(f"Drop stale/unknown RPC response ts={ts}")
+                return
+            rpc["result"] = message["result"]
+            rpc["completion"].set()
 
     def call_remote_rpc(self, message):
         ts = time.monotonic_ns()
