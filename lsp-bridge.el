@@ -1291,9 +1291,13 @@ So we build this macro to restore postion after code format."
              )))))
 
 (defun lsp-bridge-call-async (method &rest args)
-  "Call Python EPC function METHOD and ARGS asynchronously."
-  (lsp-bridge-deferred-chain
-    (lsp-bridge-epc-call-deferred lsp-bridge-epc-process (read method) args)))
+  "Call Python EPC function METHOD and ARGS asynchronously.
+Silently no-op if the EPC process is not live, so callers don't have to
+guard every call site (avoids `lsp-bridge-epc-manager nil' errors after
+network disconnect)."
+  (when (lsp-bridge-process-live-p)
+    (lsp-bridge-deferred-chain
+      (lsp-bridge-epc-call-deferred lsp-bridge-epc-process (read method) args))))
 
 (defvar-local lsp-bridge-buffer-file-deleted nil)
 
@@ -1310,7 +1314,8 @@ So we build this macro to restore postion after code format."
 
 (defun lsp-bridge-call-file-api (method &rest args)
   (if (lsp-bridge-is-remote-file)
-      (lsp-bridge-remote-send-lsp-request method args)
+      (when (lsp-bridge-process-live-p)
+        (lsp-bridge-remote-send-lsp-request method args))
     (if (and buffer-file-name (file-remote-p (buffer-file-name)))
         (message "[LSP-Bridge] remote file \"%s\" is updating info... skip call %s."
                  (buffer-file-name) method)
@@ -1544,7 +1549,7 @@ So we build this macro to restore postion after code format."
 
 (defun lsp-bridge-close-buffer-file ()
   (if (lsp-bridge-is-remote-file)
-      (progn
+      (when (lsp-bridge-process-live-p)
         (lsp-bridge-remote-send-func-request "close_file" (list lsp-bridge-remote-file-path))
         (lsp-bridge-remote-send-func-request "search_file_words_close_file" (list lsp-bridge-remote-file-path)))
 
@@ -3248,7 +3253,7 @@ then BODY is executed within that buffer."
 
 
 (defun lsp-bridge-sync-tramp-remote (force)
-  (interactive)
+  (interactive "P")
   (let* ((file-name (lsp-bridge-get-buffer-file-name-text))
          (tramp-vec (tramp-dissect-file-name file-name))
          (tramp-method (tramp-file-name-method tramp-vec))
@@ -3358,7 +3363,8 @@ SSH tramp file name is like /ssh:user@host#port:path"
     (setq lsp-bridge-ref-open-remote-file-go-back-to-ref-window nil)))
 
 (defun lsp-bridge-remote-kill-buffer ()
-  (when lsp-bridge-remote-file-flag
+  (when (and lsp-bridge-remote-file-flag
+             (lsp-bridge-process-live-p))
     (lsp-bridge-call-async "close_remote_file" lsp-bridge-remote-file-host lsp-bridge-remote-file-path)
     ))
 
