@@ -81,6 +81,31 @@ def threaded(func):
             args[0].thread_queue.append(thread)
     return wrapper
 
+def resolve_ssh_includes(config_path):
+    """Read an SSH config file, inlining any Include directives.
+
+    paramiko's SSHConfig.parse() does not handle Include directives, so we
+    resolve them manually and return a StringIO that can be passed to parse().
+    """
+    import io, glob as globmod
+    lines = []
+    config_dir = os.path.dirname(config_path)
+    with open(config_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.lower().startswith('include '):
+                pattern = stripped.split(None, 1)[1]
+                # Resolve relative paths against ~/.ssh/
+                if not os.path.isabs(pattern):
+                    pattern = os.path.join(config_dir, pattern)
+                pattern = os.path.expanduser(pattern)
+                for inc_path in sorted(globmod.glob(pattern)):
+                    with open(inc_path) as inc_f:
+                        lines.extend(inc_f.readlines())
+            else:
+                lines.append(line)
+    return io.StringIO(''.join(lines))
+
 REMOTE_FILE_SYNC_CHANNEL = 9999
 REMOTE_FILE_COMMAND_CHANNEL = 9998
 REMOTE_FILE_ELISP_CHANNEL = 9997
@@ -440,8 +465,8 @@ class LspBridge:
                 import paramiko
                 alias = server_host
                 ssh_config = paramiko.SSHConfig()
-                with open(os.path.expanduser('~/.ssh/config')) as f:
-                    ssh_config.parse(f)
+                ssh_config_path = os.path.expanduser('~/.ssh/config')
+                ssh_config.parse(resolve_ssh_includes(ssh_config_path))
                 ssh_conf = ssh_config.lookup(alias)
 
                 server_host = ssh_conf.get('hostname', server_host)
@@ -459,7 +484,10 @@ class LspBridge:
                     ssh_conf['hostname'] = server_ip
                 else:
                     # https://stackoverflow.com/a/2816838
-                    server_ips = [ str(i[4][0]) for i in socket.getaddrinfo(server_host, 0)]
+                    try:
+                        server_ips = [ str(i[4][0]) for i in socket.getaddrinfo(server_host, 0)]
+                    except socket.gaierror:
+                        server_ips = []
                     if not server_ips:
                         message_emacs(f"Could not resolve host {server_host}")
                     else:
@@ -481,6 +509,8 @@ class LspBridge:
                 ssh_conf['user'] = getpass.getuser()
             if ssh_port:
                 ssh_conf['port'] = ssh_port
+            if alias:
+                ssh_conf['_alias'] = alias
             self.host_names[server_host] = ssh_conf
             if alias:
                 self.host_names[alias] = ssh_conf

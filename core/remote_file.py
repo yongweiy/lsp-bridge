@@ -38,6 +38,96 @@ class ContainerConnectionException(Exception):
     pass
 
 
+import subprocess
+import io
+
+
+class SubprocessSSHChannel:
+    """A channel-like wrapper around an ssh -W subprocess."""
+
+    def __init__(self, proc):
+        self._proc = proc
+        self._stdin = proc.stdin
+        self._stdout = proc.stdout
+        self._stderr = proc.stderr
+
+    def sendall(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self._stdin.write(data)
+        self._stdin.flush()
+
+    def makefile(self, mode="r"):
+        return io.TextIOWrapper(self._stdout, encoding="utf-8")
+
+    def close(self):
+        try:
+            self._proc.terminate()
+        except OSError:
+            pass
+        rc = self._proc.poll()
+        if self._stderr:
+            try:
+                err = self._stderr.read()
+                if err:
+                    print(f"ssh -W stderr (rc={rc}): {err.decode(errors='replace').strip()}")
+            except Exception:
+                pass
+
+
+class SubprocessSSHClient:
+    """Minimal SSHClient replacement using subprocess ssh.
+
+    Provides exec_command() and open_channel() by spawning ssh processes.
+    Used as a fallback when paramiko cannot authenticate (e.g. cert-based
+    agents like Midway).
+
+    Uses the SSH config alias directly so OpenSSH picks up all config
+    (ProxyCommand, IdentityAgent, etc.) natively.
+    """
+
+    def __init__(self, ssh_conf):
+        # Prefer the SSH config alias so `ssh <alias>` picks up all settings
+        self._target = ssh_conf.get('_alias', ssh_conf['hostname'])
+        self._conf = ssh_conf
+        # Verify connectivity with a quick command
+        proc = subprocess.run(
+            self._ssh_base() + ['true'],
+            timeout=30, capture_output=True
+        )
+        if proc.returncode != 0:
+            import paramiko
+            raise paramiko.AuthenticationException(
+                f"subprocess ssh failed: {proc.stderr.decode(errors='replace')}"
+            )
+
+    def _ssh_base(self):
+        return ['ssh', '-o', 'BatchMode=yes', '-o', 'PermitLocalCommand=no', self._target]
+
+    def exec_command(self, command):
+        proc = subprocess.Popen(
+            self._ssh_base() + [command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Return raw byte streams like paramiko does
+        return None, proc.stdout, proc.stderr
+
+    def get_transport(self):
+        return self
+
+    def open_channel(self, kind, dest_addr, src_addr):
+        host, port = dest_addr
+        proc = subprocess.Popen(
+            self._ssh_base() + ['-W', f'{host}:{port}'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return SubprocessSSHChannel(proc)
+
+
 class RemoteFileClient(threading.Thread):
     remote_password_dict = {}
 
@@ -97,6 +187,21 @@ class RemoteFileClient(threading.Thread):
         """
         import paramiko
 
+        # Workaround for paramiko bug: AgentKey missing public_blob attribute
+        # causes AttributeError during agent auth when inner_key is None.
+        # https://github.com/paramiko/paramiko/issues/2462
+        from paramiko.agent import AgentKey
+        if not hasattr(AgentKey, '_lsp_bridge_patched'):
+            _orig_getattr = AgentKey.__getattr__ if hasattr(AgentKey, '__getattr__') else None
+            def _safe_getattr(self_key, name):
+                if name == 'public_blob':
+                    return None
+                if _orig_getattr:
+                    return _orig_getattr(self_key, name)
+                raise AttributeError(name)
+            AgentKey.__getattr__ = _safe_getattr
+            AgentKey._lsp_bridge_patched = True
+
         ssh = paramiko.SSHClient()
         ssh.load_system_host_keys()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -104,6 +209,13 @@ class RemoteFileClient(threading.Thread):
         proxy = None
         if proxy_command:
             proxy = paramiko.ProxyCommand(proxy_command)
+
+        # When IdentityAgent is configured (e.g. Midway's mcs-agent.sock),
+        # paramiko can't use cert-based agent keys for signing.  If a
+        # ProxyCommand like wssh handles auth transparently, just disable
+        # paramiko's agent auth to avoid the broken code path.
+        identity_agent = self.ssh_conf.get('identityagent', None)
+        skip_agent = bool(identity_agent and proxy_command)
 
         try:
             if use_gssapi:
@@ -116,23 +228,44 @@ class RemoteFileClient(threading.Thread):
                 # when user specify the SSH private key path
                 # disable searching for discoverable private key files in ~/.ssh/
                 look_for_keys = not self.user_ssh_private_key
-                ssh.connect(self.ssh_host, port=self.ssh_port, username=self.ssh_user, key_filename=ssh_private_key, look_for_keys=look_for_keys, sock=proxy)
+                ssh.connect(self.ssh_host, port=self.ssh_port, username=self.ssh_user, key_filename=ssh_private_key, look_for_keys=look_for_keys, allow_agent=not skip_agent, sock=proxy)
         except:
             print(traceback.format_exc())
 
-            # Try login server with password if private key is not available.
+            # Try subprocess ssh as fallback
             try:
-                # running `get-ssh-password` on macOS will raise error of 'The macOS Keychain auth-source backend doesn’t support creation yet'
-                password = RemoteFileClient.remote_password_dict[self.ssh_host] if self.ssh_host in RemoteFileClient.remote_password_dict else get_ssh_password(self.ssh_user, self.ssh_host, self.ssh_port)
-
-                ssh.connect(self.ssh_host, port=self.ssh_port, username=self.ssh_user, password=password)
-
-                # Only remeber server's login password after login server successfully.
-                # Password only record in memory for session login, not save in file.
-                RemoteFileClient.remote_password_dict[self.ssh_host] = password
-            except:
+                print("Paramiko auth failed, trying subprocess ssh fallback...")
+                ssh = SubprocessSSHClient(self.ssh_conf)
+                print("Subprocess ssh fallback connected successfully")
+            except Exception as subprocess_err:
                 print(traceback.format_exc())
-                raise paramiko.AuthenticationException()
+
+                # If the failure is Midway/WSSH related, prompting for a
+                # password is pointless: cert-only auth, no password exists.
+                # Surface a clear message and bail instead of asking the user.
+                err_str = str(subprocess_err)
+                if "WSSH" in err_str or "Midway" in err_str or "mwinit" in err_str:
+                    message_emacs(
+                        f"Midway/WSSH auth failed for {self.ssh_host}; "
+                        "run `mwinit` and retry."
+                    )
+                    raise paramiko.AuthenticationException(
+                        "Midway authentication required (run mwinit)"
+                    ) from subprocess_err
+
+                # Last resort: try paramiko with password
+                try:
+                    password = RemoteFileClient.remote_password_dict[self.ssh_host] if self.ssh_host in RemoteFileClient.remote_password_dict else get_ssh_password(self.ssh_user, self.ssh_host, self.ssh_port)
+
+                    ssh = paramiko.SSHClient()
+                    ssh.load_system_host_keys()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(self.ssh_host, port=self.ssh_port, username=self.ssh_user, password=password, sock=proxy)
+
+                    RemoteFileClient.remote_password_dict[self.ssh_host] = password
+                except:
+                    print(traceback.format_exc())
+                    raise paramiko.AuthenticationException()
 
         return ssh
 
@@ -172,16 +305,27 @@ class RemoteFileClient(threading.Thread):
             log_time_debug(f"Sended to server {self.ssh_host} port {self.server_port}: {message}")
 
     def run(self):
-        chan_file = self.chan.makefile("r")
-        while True:
-            data = chan_file.readline().strip()
-            if not data:
-                break
+        try:
+            chan_file = self.chan.makefile("r")
+            while True:
+                data = chan_file.readline().strip()
+                if not data:
+                    print(f"Channel EOF from {self.ssh_host}:{self.server_port}")
+                    break
 
-            message = parse_json_content(data)
-            log_time_debug(f"Received from server {self.ssh_host} port {self.server_port}: {message}")
-            self.callback(message)
-        self.chan.close()
+                try:
+                    message = parse_json_content(data)
+                except Exception:
+                    # Skip non-JSON lines (e.g. SSH banners, heartbeat pongs)
+                    print(f"Skipping non-JSON data from {self.ssh_host}: {data[:200]}")
+                    continue
+                log_time_debug(f"Received from server {self.ssh_host} port {self.server_port}: {message}")
+                self.callback(message)
+        except Exception as e:
+            logger.exception(e)
+        finally:
+            self.chan.close()
+            self._notify_dead()
 
     def start_lsp_bridge_process(self):
         remote_python_command = self.remote_python_command
