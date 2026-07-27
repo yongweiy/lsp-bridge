@@ -1,0 +1,7 @@
+{
+  "default": "nki-pyright",
+  "diagnostics": ["nki-pyright", "ruff"],
+  "code_action": ["nki-pyright", "ruff"],
+  "execute_command": ["nki-pyright", "ruff"],
+  "formatting": "ruff"
+}
