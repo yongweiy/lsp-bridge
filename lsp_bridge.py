@@ -314,7 +314,7 @@ class LspBridge:
             client = RemoteFileClient(
                 ssh_conf,
                 server_port,
-                lambda message: self.receive_remote_message(message, server_port),
+                lambda message: self.receive_remote_message(message, server_port, server_host),
             )
         except paramiko.AuthenticationException:
             # cloud not login server
@@ -382,7 +382,7 @@ class LspBridge:
             client = DockerFileClient(
                 container_name=container_name,
                 server_port=server_port,
-                callback=lambda message: self.receive_remote_message(message, server_port),
+                callback=lambda message: self.receive_remote_message(message, server_port, container_name),
             )
         except ContainerConnectionException as e:
             print(f"Failed to connect {container_name}, is it running?")
@@ -451,7 +451,17 @@ class LspBridge:
             finally:
                 queue.task_done()
 
-    def receive_remote_message(self, message, server_port):
+    def receive_remote_message(self, message, server_port, server_host=None):
+        # The daemon stamps replies with `message["host"] = client_address[0]`,
+        # which is always 127.0.0.1 (the loopback source of the SSH direct-tcpip
+        # tunnel) and is never a key in `host_names`.  Routing a reply by that
+        # value drops it: get_socket_client(127.0.0.1) -> KeyError.  Replies must
+        # go back over the connection they arrived on, so overwrite host with the
+        # real registered SSH host this client was created for.  RPC responses are
+        # matched by timestamp on the daemon, so the host field only steers local
+        # routing -- correcting it here is sufficient and needs no daemon change.
+        if server_host is not None and isinstance(message, dict):
+            message["host"] = server_host
         if server_port == REMOTE_FILE_SYNC_CHANNEL:
             self.remote_file_receiver_queue.put(message)
         elif server_port == REMOTE_FILE_COMMAND_CHANNEL:
