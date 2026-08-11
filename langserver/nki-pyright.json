@@ -2,8 +2,9 @@
   "name": "nki-pyright",
   "languageId": "python",
   "command": [
-    "pyright-langserver",
-    "--stdio"
+    "basedpyright-langserver",
+    "--stdio",
+    "--cancellationReceive=file:%FILEHASH%"
   ],
   "settings": {
     "python.analysis": {
@@ -17,7 +18,9 @@
       "autoSearchPaths": true,
       "extraPaths": ["python", "nrtpy/python", "build/python/py-staging"]
     },
-    "pythonPath": "/opt/nki-venv/bin/python",
-    "venvPath": ""
+    "python": {
+      "pythonPath": "/opt/nki-venv/bin/python",
+      "venvPath": ""
+    }
   }
 }
