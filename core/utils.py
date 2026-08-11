@@ -256,10 +256,17 @@ def get_emacs_vars(args):
     global lsp_bridge_server
 
     if lsp_bridge_server and lsp_bridge_server.file_elisp_server:
-        return lsp_bridge_server.file_elisp_server.call_remote_rpc({
+        result = lsp_bridge_server.file_elisp_server.call_remote_rpc({
             "command": "get_emacs_vars",
             "args": args
         })
+        # call_remote_rpc returns None on timeout (e.g. reply lost across a
+        # tunnel reconnect).  Callers unpack this positionally
+        # (`[x] = get_emacs_vars([...])`), so degrade to Emacs' nil == False for
+        # each requested var instead of returning a non-iterable None.
+        if result is None:
+            return [False for _ in args]
+        return result
     else:
         results = epc_client.call_sync("get-emacs-vars", args)
         return list(map(lambda result: convert_emacs_bool(result[0], result[1]) if result != [] else False, results))

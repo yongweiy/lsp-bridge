@@ -42,6 +42,17 @@ import subprocess
 import io
 
 
+# Upper bound (seconds) on how long a daemon->Emacs RPC (get_emacs_vars /
+# get_emacs_func_result over the elisp channel) may block waiting for a reply.
+# Bounding this is what prevents a reconnect deadlock: init_search_backends
+# issues such RPCs, and the command channel gates all LSP requests behind
+# init_search_backends_complete_event.  If a reply is lost across a tunnel
+# reconnect an unbounded wait leaves init unfinished, the event never set, and
+# the whole daemon wedged.  On timeout we return None (callers already tolerate
+# a nil/empty result) so init completes with defaults and the gate is released.
+RPC_REPLY_TIMEOUT = 15
+
+
 class SubprocessSSHChannel:
     """A channel-like wrapper around an ssh -W subprocess."""
 
@@ -719,7 +730,16 @@ class FileElispServer(RemoteFileServer):
             del self.rpcs[ts]
             return None
         else:
-            cpl.wait()
+            if not cpl.wait(timeout=RPC_REPLY_TIMEOUT):
+                # No reply within the bound -- almost always a reply lost across
+                # a tunnel reconnect.  Return None rather than block forever so
+                # init_search_backends can finish (with defaults) and release the
+                # command-channel gate.  A late reply for this ts is dropped by
+                # handle_message ("Drop stale/unknown RPC response").
+                log_time(f"RPC {message.get('command')} timed out after "
+                         f"{RPC_REPLY_TIMEOUT}s; returning None")
+                self.rpcs.pop(ts, None)
+                return None
             result = self.rpcs[ts]["result"]
             del self.rpcs[ts]
             return result
